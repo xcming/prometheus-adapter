@@ -9,6 +9,7 @@ require (
 	github.com/prometheus/common v0.26.0
 	github.com/spf13/cobra v1.2.1
 	github.com/stretchr/testify v1.7.0
+	golang.org/x/time v0.0.0-20210723032227-1f47c861a9ac
 	gopkg.in/yaml.v2 v2.4.0
 	k8s.io/api v0.22.0
 	k8s.io/apimachinery v0.22.0

@@ -28,6 +28,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
@@ -81,6 +83,11 @@ type PrometheusAdapter struct {
 	// MetricsMaxAge is the period to query available metrics for
 	MetricsMaxAge time.Duration
 
+	// QPS indicates the maximum QPS to the master from this client.
+	QPS float32
+	// Maximum burst for throttle.
+	Burst int32
+
 	metricsConfig *adaptercfg.MetricsDiscoveryConfig
 }
 
@@ -115,6 +122,18 @@ func (cmd *PrometheusAdapter) makePromClient() (prom.Client, error) {
 		}
 		httpClient.Transport = transport.NewBearerAuthRoundTripper(string(data), httpClient.Transport)
 	}
+
+	if cmd.QPS == 0 {
+		cmd.QPS = 5
+	}
+	if cmd.Burst == 0 {
+		cmd.Burst = 10
+	}
+	limiter := rate.NewLimiter(rate.Limit(cmd.QPS), int(cmd.Burst))
+	originalTransport := httpClient.Transport
+	rateLimitedTransport := &rateLimitedRoundTripper{transport: originalTransport, limiter: limiter}
+	httpClient.Transport = rateLimitedTransport
+
 	genericPromClient := prom.NewGenericAPIClient(httpClient, baseURL, parseHeaderArgs(cmd.PrometheusHeaders))
 	instrumentedGenericPromClient := mprom.InstrumentGenericAPIClient(genericPromClient, baseURL.String())
 	return prom.NewClientForAPI(instrumentedGenericPromClient), nil
@@ -144,6 +163,9 @@ func (cmd *PrometheusAdapter) addFlags() {
 		"interval at which to re-list the set of all available metrics from Prometheus")
 	cmd.Flags().DurationVar(&cmd.MetricsMaxAge, "metrics-max-age", cmd.MetricsMaxAge, ""+
 		"period for which to query the set of available metrics from Prometheus")
+
+	cmd.Flags().Float32Var(&cmd.QPS, "qps", cmd.QPS, "QPS of prom client")
+	cmd.Flags().Int32Var(&cmd.Burst, "burst", cmd.Burst, "Burst of prom client")
 }
 
 func (cmd *PrometheusAdapter) loadConfig() error {
@@ -342,6 +364,7 @@ func main() {
 
 // makeKubeconfigHTTPClient constructs an HTTP for connecting with the given auth options.
 func makeKubeconfigHTTPClient(inClusterAuth bool, kubeConfigPath string) (*http.Client, error) {
+	klog.Infof("inclusterauth: %v, configpath: %v", inClusterAuth, kubeConfigPath)
 	// make sure we're not trying to use two different sources of auth
 	if inClusterAuth && kubeConfigPath != "" {
 		return nil, fmt.Errorf("may not use both in-cluster auth and an explicit kubeconfig at the same time")
@@ -421,4 +444,16 @@ func parseHeaderArgs(args []string) http.Header {
 		headers.Add(parts[0], value)
 	}
 	return headers
+}
+
+type rateLimitedRoundTripper struct {
+	transport http.RoundTripper
+	limiter   *rate.Limiter
+}
+
+func (rt *rateLimitedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := rt.limiter.Wait(req.Context()); err != nil {
+		return nil, err
+	}
+	return rt.transport.RoundTrip(req)
 }
